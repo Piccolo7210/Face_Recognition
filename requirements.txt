@@ -1,0 +1,11 @@
+# Core numerical library
+numpy==2.4.0
+
+# Computer vision (includes DNN, YuNet, SFace)
+opencv-python==4.12.0.88
+
+# Image handling
+Pillow==12.1.0
+
+# Optional but recommended (future liveness, landmarks, utilities)
+mediapipe==0.10.31
