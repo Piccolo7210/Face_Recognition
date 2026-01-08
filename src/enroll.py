@@ -1,80 +1,114 @@
 import os
+import shutil
 import cv2
 import numpy as np
-from utils import ensure_dir
+from tkinter import Tk, filedialog
+
+from db.db import get_connection
+
+# ------------------ PATHS ------------------
 
 BASE = os.path.dirname(os.path.dirname(__file__))
 MODELS = os.path.join(BASE, "models")
 GALLERY = os.path.join(BASE, "data", "gallery")
-DB = os.path.join(BASE, "db")
+
+os.makedirs(GALLERY, exist_ok=True)
 
 DETECTOR_MODEL = os.path.join(MODELS, "face_detection_yunet_2023mar.onnx")
 RECOG_MODEL = os.path.join(MODELS, "face_recognition_sface_2021dec.onnx")
 
-ensure_dir(DB)
+# ------------------ MODELS ------------------
 
 detector = cv2.FaceDetectorYN.create(
-    DETECTOR_MODEL,
-    "",
-    (320, 320),
-    score_threshold=0.6,   # ⬅️ LOWERED
-    nms_threshold=0.3,
-    top_k=5000
+    DETECTOR_MODEL, "", (320, 320), 0.6, 0.3, 5000
 )
-
-
 recognizer = cv2.FaceRecognizerSF.create(RECOG_MODEL, "")
 
-names = []
-embeddings = []
+# ------------------ USER INPUT ------------------
 
-for person in sorted(os.listdir(GALLERY)):
-    person_dir = os.path.join(GALLERY, person)
-    if not os.path.isdir(person_dir):
-        continue
+print("\n=== FACE ENROLLMENT ===\n")
 
-    for img_name in sorted(os.listdir(person_dir)):
-        if not img_name.lower().endswith((".jpg", ".png", ".jpeg")):
-            continue
+name = input("Name: ").strip()
+age = int(input("Age: ").strip())
+national_id = input("National ID: ").strip()
 
-        img_path = os.path.join(person_dir, img_name)
-        img = cv2.imread(img_path)
-        if img is None:
-            continue
+person_dir = os.path.join(GALLERY, name)
+os.makedirs(person_dir, exist_ok=True)
 
-        h, w = img.shape[:2]
-        target_w = 640
-        scale = target_w / w
-        target_h = int(h * scale)
-        resized_img = cv2.resize(img, (target_w, target_h))
-        detector.setInputSize((target_w, target_h))
-        _, faces = detector.detect(resized_img)
+# ------------------ IMAGE UPLOAD PROMPT ------------------
 
-        if faces is None or len(faces) == 0:
-            print(f"No face found: {img_path}")
-            continue
+print("\nSelect images for enrollment (Ctrl / Shift for multiple selection)")
 
-        face = faces[0].copy()
-        face[:14] /= scale  # rescale to original image size
-        aligned = recognizer.alignCrop(img, face)
-        emb = recognizer.feature(aligned).flatten().astype(np.float32)
-        
-
-        names.append(person)
-        embeddings.append(emb)
-
-        print(f"Enrolled: {person} from {img_name}")
-
-if not embeddings:
-    raise RuntimeError("No faces enrolled. Add better images.")
-
-np.savez_compressed(
-    os.path.join(DB, "embeddings.npz"),
-    embeddings=np.array(embeddings)
+Tk().withdraw()  # hide root window
+image_paths = filedialog.askopenfilenames(
+    title="Select face images",
+    filetypes=[("Image Files", "*.jpg *.jpeg *.png")]
 )
 
-with open(os.path.join(DB, "names.txt"), "w", encoding="utf-8") as f:
-    for n in names:
-        f.write(n + "\n")
+if not image_paths:
+    raise RuntimeError("No images selected.")
+
+# ------------------ COPY IMAGES ------------------
+
+saved_paths = []
+for idx, src_path in enumerate(image_paths, start=1):
+    ext = os.path.splitext(src_path)[1]
+    dst_path = os.path.join(person_dir, f"img_{idx:03d}{ext}")
+    shutil.copy(src_path, dst_path)
+    saved_paths.append(dst_path)
+
+print(f"\nSaved {len(saved_paths)} images to {person_dir}")
+
+# ------------------ FACE EMBEDDING ------------------
+
+embeddings = []
+
+for img_path in saved_paths:
+    img = cv2.imread(img_path)
+    if img is None:
+        continue
+
+    h, w = img.shape[:2]
+    scale = 640 / w
+    resized = cv2.resize(img, (640, int(h * scale)))
+
+    detector.setInputSize((640, resized.shape[0]))
+    _, faces = detector.detect(resized)
+
+    if faces is None:
+        print(f"No face detected: {os.path.basename(img_path)}")
+        continue
+
+    face = faces[0].copy()
+    face[:14] /= scale
+
+    aligned = recognizer.alignCrop(img, face)
+    emb = recognizer.feature(aligned).flatten().astype(np.float32)
+
+    embeddings.append(emb)
+
+if not embeddings:
+    raise RuntimeError("No valid faces found in selected images.")
+
+# ------------------ AVERAGE EMBEDDING ------------------
+
+avg_embedding = np.mean(embeddings, axis=0)
+
+# ------------------ DATABASE INSERT ------------------
+
+conn = get_connection()
+cur = conn.cursor()
+
+cur.execute(
+    """
+    INSERT INTO persons (name, age, national_id, embedding)
+    VALUES (%s, %s, %s, %s)
+    """,
+    (name, age, national_id, avg_embedding.tolist())
+)
+
+conn.commit()
+cur.close()
+conn.close()
 
 print("\n✅ Enrollment completed successfully")
